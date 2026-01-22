@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# Environment Variables (CRITICAL - DO NOT COMMIT)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+RAG_DEBUG.md
+WARROOM_DEBUG.md
+
+# Temporary files
+*.tmp
+*.bak
+.plan
+
+# Database (local only)
+*.db
+*.sqlite
+
+# Agent Archives (optional - keep if you want to share examples)
+# agent_archives/
+
+# Test files (optional)
+test_*.py
+verify_*.py
+debug_*.py

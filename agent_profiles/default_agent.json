@@ -1,0 +1,18 @@
+{
+  "name": "Default Agent",
+  "description": "Standard helper agent",
+  "config": {
+    "model_config": {
+      "litellm_model_name": "gemini/gemini-2.0-flash-lite",
+      "temperature": 0.0,
+      "max_tokens": 8192
+    },
+    "rag_config": {
+      "corpus_id": "4611686018427387904",
+      "corpus_name": "default"
+    },
+    "base_system_prompt": "You are a helpful assistant.",
+    "specialized_system_prompt": ""
+  },
+  "enabled": true
+}

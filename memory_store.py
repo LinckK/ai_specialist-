@@ -34,20 +34,11 @@ class VectorMemoryStore:
         """Lazy load embeddings model."""
         if self._embeddings is None:
             try:
-                from langchain_google_genai import GoogleGenerativeAIEmbeddings
-                # Try GEMINI_API_KEY first, then fallback to GEMINIFLASH_API_KEY
-                api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINIFLASH_API_KEY")
-                if not api_key:
-                    print("[Memory] Warning: No GEMINI_API_KEY or GEMINIFLASH_API_KEY found")
-                    return None
-                # Use embedding-001 for best quality (same model for storage & retrieval)
-                # task_type will be specified per-call for optimal semantic matching
-                self._embeddings = GoogleGenerativeAIEmbeddings(
-                    model="models/embedding-001",
-                    google_api_key=api_key
-                )
-            except ImportError:
-                print("[Memory] Warning: langchain_google_genai not installed")
+                from vertexai.language_models import TextEmbeddingModel
+                # Using standard Gecko model for general embedding compatibility within Vertex AI
+                self._embeddings = TextEmbeddingModel.from_pretrained("textembedding-gecko")
+            except Exception as e:
+                print(f"[Memory] Warning: Failed to load TextEmbeddingModel: {e}")
                 self._embeddings = None
         return self._embeddings
     
@@ -74,9 +65,9 @@ class VectorMemoryStore:
             return False
         
         try:
-            # Generate embedding with RETRIEVAL_DOCUMENT task_type for storage
-            # This optimizes the vector for being retrieved later
-            embedding = self.embeddings.embed_documents([content], task_type="RETRIEVAL_DOCUMENT")[0]
+            # Generate embedding using Vertex AI Model
+            embedding_response = self.embeddings.get_embeddings([content])
+            embedding = embedding_response[0].values
             
             # Insert into Supabase
             self.client.table("memory_vectors").insert({
@@ -88,14 +79,14 @@ class VectorMemoryStore:
                 "embedding": embedding
             }).execute()
             
-            print(f"[Memory] Saved: [{scope}/{fact_type}] {content[:50]}...")
+            print(f"[Memory] Saved ({fact_type}/{scope}): {content[:50]}...")
             return True
             
         except Exception as e:
             print(f"[Memory] Save failed: {e}")
             return False
     
-    def save_memories_batch(
+    def save_batch(
         self,
         conversation_id: str,
         facts: List[Dict],
@@ -130,43 +121,107 @@ class VectorMemoryStore:
         limit: int = 10
     ) -> List[Dict]:
         """
-        Retrieve relevant facts using vector similarity search.
-        
-        Returns facts from AGENT and GLOBAL scopes only.
-        CHAT facts should be retrieved separately (always included).
+        [V6 RAG AUDIT FIX]
+        Retrieve relevant facts using HYBRID SEARCH (Vector + BM25) with Reciprocal Rank Fusion (RRF).
         """
         if not self.embeddings:
             print("[Memory] Cannot search: embeddings not available")
             return []
         
         try:
-            # Generate query embedding with RETRIEVAL_QUERY task_type
-            # This optimizes semantic bridge between query and stored documents
-            query_embedding = self.embeddings.embed_query(query, task_type="RETRIEVAL_QUERY")
+            # 1. VECTOR SEARCH (Semantic) via Vertex AI
+            embedding_response = self.embeddings.get_embeddings([query])
+            query_embedding = embedding_response[0].values
             
-            # Call Supabase similarity search function
-            response = self.client.rpc(
+            vector_response = self.client.rpc(
                 "match_memory",
                 {
                     "query_embedding": query_embedding,
-                    "match_count": limit,
+                    "match_count": limit * 2, # Busca o dobro para o RRF ter espaço
                     "filter_scope": ["AGENT", "GLOBAL"],
                     "filter_agent_type": agent_type
                 }
             ).execute()
             
-            results = []
-            for row in response.data or []:
-                results.append({
-                    "content": row["content"],
-                    "type": row["fact_type"],
-                    "scope": row["scope"],
-                    "created_at": row["created_at"],
-                    "similarity": row.get("similarity", 0)
+            vector_results = vector_response.data or []
+            
+            # 2. KEYWORD SEARCH (Fetch recent global/agent memories for BM25)
+            # Como não temos RPC BM25 no Supabase, puxamos os 100 mais recentes para rankear localmente
+            recent_query = self.client.table("memory_vectors")\
+                .select("content, fact_type, scope, created_at")\
+                .in_("scope", ["AGENT", "GLOBAL"])\
+                .order("created_at", desc=True)\
+                .limit(100)
+            
+            if agent_type:
+                # O Supabase DB API requer chaining dinâmico para o OR não quebrar, mas vamos puxar tudo pro Agent e Global
+                recent_query = self.client.table("memory_vectors")\
+                    .select("content, fact_type, scope, created_at")\
+                    .in_("scope", ["AGENT", "GLOBAL"])\
+                    .order("created_at", desc=True)\
+                    .limit(150)
+                    
+            recent_response = recent_query.execute()
+            recent_results = recent_response.data or []
+            
+            # Executa BM25 Local (Sparse)
+            bm25_results = []
+            try:
+                from rank_bm25 import BM25Okapi
+                tokenized_corpus = [doc["content"].lower().split(" ") for doc in recent_results]
+                if tokenized_corpus:
+                    bm25 = BM25Okapi(tokenized_corpus)
+                    tokenized_query = query.lower().split(" ")
+                    doc_scores = bm25.get_scores(tokenized_query)
+                    
+                    # Associa scores e ordena
+                    for idx, score in enumerate(doc_scores):
+                        if score > 0:
+                            item = recent_results[idx].copy()
+                            item["bm25_score"] = score
+                            bm25_results.append(item)
+                    bm25_results.sort(key=lambda x: x["bm25_score"], reverse=True)
+            except ImportError:
+                print("[Memory] rank_bm25 ausente. Usando apenas Vetor.")
+            
+            # 3. RECIPROCAL RANK FUSION (RRF)
+            k = 60 # Constante RRF
+            fused_scores = {}
+            fused_docs = {}
+            
+            # Adiciona Vector Ranks
+            for rank, doc in enumerate(vector_results):
+                content = doc["content"]
+                if content not in fused_scores:
+                    fused_scores[content] = 0
+                    fused_docs[content] = doc
+                fused_scores[content] += 1 / (rank + 1 + k)
+                
+            # Adiciona BM25 Ranks
+            for rank, doc in enumerate(bm25_results):
+                content = doc["content"]
+                if content not in fused_scores:
+                    fused_scores[content] = 0
+                    fused_docs[content] = doc
+                fused_scores[content] += 1 / (rank + 1 + k)
+                
+            # Ordena pelo RRF score final
+            sorted_fused = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+            
+            final_results = []
+            for content, rrf_score in sorted_fused[:limit]:
+                doc = fused_docs[content]
+                final_results.append({
+                    "content": doc["content"],
+                    "type": doc.get("fact_type", doc.get("type", "GENERAL")),
+                    "scope": doc["scope"],
+                    "created_at": doc["created_at"],
+                    "similarity": doc.get("similarity", 0), # Manter para log
+                    "rrf_score": rrf_score
                 })
             
-            print(f"[Memory] Retrieved {len(results)} relevant facts")
-            return results
+            print(f"[Memory] Hybrid RRF Retrieved {len(final_results)} facts (Vector: {len(vector_results)}, BM25: {len(bm25_results)})")
+            return final_results
             
         except Exception as e:
             print(f"[Memory] Retrieval failed: {e}")

@@ -22,7 +22,7 @@ except ImportError:
 
 # Configuration
 PROJECT_ID = "agenticraga"
-LOCATION = "europe-west1"
+LOCATION = "us-west1"
 
 # Initialize Vertex AI
 try:

@@ -1,0 +1,20 @@
+# Core AI & LLM
+litellm==1.49.4
+google-cloud-aiplatform>=1.38.0  # For Vertex AI and RAG
+google-auth>=2.22.0
+
+# Database
+supabase>=2.0.3
+
+# Helper libs
+python-dotenv>=1.0.0
+requests>=2.31.0
+colorama>=0.4.6
+rich>=13.7.0
+
+# LangChain (Required for Memory Embeddings)
+langchain-google-genai>=0.0.3
+
+
+# PDF/File Processing (if needed for upload tool specific parsing)
+pypdf>=3.17.0

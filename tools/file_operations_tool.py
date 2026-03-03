@@ -84,23 +84,142 @@ def list_files(directory: str = ".", pattern: Optional[str] = None) -> str:
     except Exception as e:
         return f"Error listing files: {e}"
 
+def _transcribe_multimodal_file(file_path: Path, mime_type: str) -> dict:
+    """
+    Uses Gemini Vision (Multimodal) to transcribe images or scanned PDFs.
+    """
+    try:
+        import vertexai
+        from vertexai.generative_models import GenerativeModel, Part
+        
+        # Hardcoded config matches rag_tool.py
+        PROJECT_ID = "agenticraga" 
+        LOCATION = "us-west1"
+        
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        
+        # Use a fast multimodal model
+        model = GenerativeModel("gemini-1.5-flash-002")
+        
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+            
+        part = Part.from_data(data=file_data, mime_type=mime_type)
+        
+        prompt = """
+        TASK: Transcribe this document/image exactly.
+        - If it is a contract, capture every clause, signature, and detail.
+        - If it contains charts or graphs, describe the data structure and values in detail.
+        - If it is handwritten, transcribe it to the best of your ability.
+        - Output ONLY the text content.
+        """
+        
+        response = model.generate_content([part, prompt])
+        return {"success": True, "text": response.text}
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 def read_file(file_path: str, max_lines: Optional[int] = None) -> str:
     """
     Lê o conteúdo exato de um arquivo existente.
-    **CASO DE USO:** Use quando o usuário referenciar um arquivo específico (ex: '@relatorio.pdf') ou para analisar código existente antes de editar.
-    **IMPORTANTE:** Se o arquivo for muito grande, use o parâmetro `max_lines` para ler o cabeçalho/estrutura primeiro.
+    Suporta:
+    - Textos (.txt, .md, .py, etc)
+    - PDFs (Texto selecionável + OCR para escaneados)
+    - Imagens (.png, .jpg, .jpeg) -> Transcrição via Vision AI
     """
     target_file = _resolve_path(file_path)
     print(f"\n--- Reading file: {target_file} ---")
     
-    # v6.3: RAG Hygiene - Binary Blacklist
+    suffix = target_file.suffix.lower()
+    
+    # 1. IMAGE HANDLING (OCR)
+    if suffix in ['.png', '.jpg', '.jpeg']:
+        print(f"[FileOps] Image detected. Using Gemini Vision OCR...")
+        mime_type = "image/png" if suffix == '.png' else "image/jpeg"
+        ocr_result = _transcribe_multimodal_file(target_file, mime_type)
+        
+        if ocr_result["success"]:
+            return f"Analyzed Image: {target_file.name}\n[DEBUG: MODE=VISION OCR]\n========================================\n{ocr_result['text']}"
+        else:
+            return f"Error reading image: {ocr_result['error']}"
+
+    # 2. PDF HANDLING (Hybrid: pypdf -> Vision Fallback)
+    if suffix == '.pdf':
+        try:
+            print(f"[FileOps] Reading PDF: {target_file}")
+            from pypdf import PdfReader
+            
+            reader = PdfReader(str(target_file))
+            num_pages = len(reader.pages)
+            extracted_text = ""
+            
+            # Read first 50 pages text
+            max_pdf_pages = 50 
+            pages_read = 0
+            
+            for i, page in enumerate(reader.pages):
+                if i >= max_pdf_pages:
+                    extracted_text += f"\n\n[TRUNCATED] Stopped basic read after {max_pdf_pages} pages."
+                    break
+                text = page.extract_text()
+                if text:
+                    extracted_text += f"\n--- Page {i+1} ---\n{text}"
+                pages_read += 1
+            
+            char_count = len(extracted_text)
+            is_scanned = char_count < 100 and num_pages > 0
+            
+            result_header = f"Analyzed PDF: {target_file.name}\n"
+            result_header += f"========================================\n"
+            result_header += f"[DEBUG INDICATORS]\n"
+            result_header += f"- Pages: {num_pages}\n"
+            result_header += f"- Text Layer Chars: {char_count}\n"
+            
+            # FALLBACK TO OCR IF SCANNED
+            if is_scanned:
+                print(f"[FileOps] PDF appears scanned (only {char_count} chars). Switching to Gemini Vision OCR...")
+                result_header += f"- Mode: ⚠️ SCANNED (Switching to Vision AI)\n"
+                result_header += f"========================================\n\n"
+                
+                ocr_result = _transcribe_multimodal_file(target_file, "application/pdf")
+                if ocr_result["success"]:
+                    return result_header + ocr_result["text"]
+                else:
+                    return result_header + f"[ERROR] Vision OCR failed: {ocr_result['error']}"
+            else:
+                result_header += f"- Mode: ✅ TEXT LAYER\n"
+                result_header += f"========================================\n\n"
+                return result_header + extracted_text
+            
+        except ImportError:
+            return "Error: pypdf library not found. Please install it: pip install pypdf"
+        except Exception as e:
+            return f"Error reading PDF: {e}"
+
+    # 3. DOCX HANDLING
+    if suffix == '.docx':
+        try:
+            print(f"[FileOps] Reading DOCX: {target_file}")
+            import docx
+            doc = docx.Document(target_file)
+            extracted_text = "\n".join([para.text for para in doc.paragraphs])
+            
+            result_header = f"Analyzed DOCX: {target_file.name}\n"
+            result_header += f"========================================\n\n"
+            return result_header + extracted_text
+        except ImportError:
+            return "Error: python-docx library not found. Please install it: pip install python-docx"
+        except Exception as e:
+            return f"Error reading DOCX: {e}"
+
+    # 4. TEXT HANDLING (Standard)
     BINARY_EXTENSIONS = {
         '.exe', '.dll', '.bin', '.zip', '.tar', '.gz', 
-        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico',
-        '.pdf', '.docx', '.xlsx', '.pptx', # specialized readers needed
+        '.ico', '.xlsx', '.pptx', 
         '.pyc', '.obj', '.db', '.sqlite'
     }
-    
+
     if target_file.suffix.lower() in BINARY_EXTENSIONS:
         msg = f"Error: Cannot read binary file type '{target_file.suffix}' as text. Use specific tools for this format."
         print(f"[RAG Hygiene] Blocked reading of binary file: {target_file.name}")

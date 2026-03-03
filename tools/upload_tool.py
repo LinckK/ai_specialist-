@@ -12,14 +12,16 @@ from typing import Dict, Optional
 
 # Load environment variables FIRST
 from dotenv import load_dotenv
-load_dotenv()
+from pathlib import Path
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 import vertexai
 from vertexai import rag
 
 # Configuration
 PROJECT_ID = "agenticraga"
-LOCATION = "europe-west1"
+LOCATION = "us-west1"
 MAX_FILE_SIZE_MB = 32
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 GCS_STAGING_BUCKET = "agenticraga-rag-staging"
@@ -80,6 +82,9 @@ def validate_file(file_path: str) -> tuple[bool, str]:
         return False, f"Unsupported MIME type: {mime_type}"
     
     return True, ""
+
+
+
 
 
 def upload_to_gcs(file_path: Path, bucket_name: str) -> str:

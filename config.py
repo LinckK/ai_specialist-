@@ -7,7 +7,7 @@ class ModelConfig:
     # The provider name that litellm will use
     litellm_model_name: str = "gemini/gemini-3-pro-preview"
     # Secondary model for fast tasks (summarization, extraction)
-    fast_model_name: str = "gemini/gemini-3-flash-001"
+    fast_model_name: str = "gemini/gemini-2.5-flash"
     temperature: float = 0.0
     max_tokens: int = 4096
     top_p: float = 0.85

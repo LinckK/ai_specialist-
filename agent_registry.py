@@ -87,12 +87,12 @@ class AgentRegistry:
         )
 
     def list_agents(self) -> List[AgentProfile]:
-        """Lists all available agent profiles."""
+        """Lists all available agent profiles from the database."""
         agents_data = db.list_agents()
         profiles = []
         
         for agent_data in agents_data:
-            # Reconstruct AgentConfig (duplicate logic, could be extracted)
+            # Reconstruct AgentConfig
             config_data = agent_data["config"]
             
             # Handle case where config is returned as a JSON string

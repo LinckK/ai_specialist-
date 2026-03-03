@@ -107,7 +107,7 @@ def create_new_agent_interactive():
     
     # Default Configs
     model_config = ModelConfig(litellm_model_name="gemini/gemini-2.0-flash-lite")
-    rag_config = RAGConfig() # Default RAG config
+    rag_config = RAGConfig(corpus_id=None) # Set to None to trigger AUTO-CREATION in registry
     
     config = AgentConfig(
         model_config=model_config,

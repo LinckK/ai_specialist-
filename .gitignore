@@ -62,3 +62,11 @@ WARROOM_DEBUG.md
 test_*.py
 verify_*.py
 debug_*.py
+
+# Service Account Keys (CRITICAL - NEVER COMMIT)
+.gcloud/
+service-account*.json
+*-key.json
+credentials*.json
+# Exception: Allow agent profile JSONs
+!agent_profiles/*.json

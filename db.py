@@ -14,7 +14,10 @@ except ImportError:
 
 from .models import Message, Conversation
 
-load_dotenv()
+from pathlib import Path
+ # Explicitly load .env from project root
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 class Database:
     _instance = None
@@ -424,6 +427,259 @@ class Database:
         except Exception as e:
             print(f"[DB] Error fetching critical facts: {e}")
             return []
+
+    # ================================================================
+    # V2: PROJECT STATE & BOARDROOM METHODS
+    # These are ADDITIVE — they don't change any existing behavior.
+    # ================================================================
+
+    def create_project(self, name: str, user_id: str = None, drive_folder_id: str = None) -> Optional[Dict]:
+        """Creates a new project with an empty context_snapshot."""
+        data = {
+            "name": name,
+            "status": "active",
+            "context_snapshot": {},
+        }
+        if user_id:
+            data["user_id"] = user_id
+        if drive_folder_id:
+            data["drive_folder_id"] = drive_folder_id
+
+        if not self.client:
+            # Local fallback
+            fake_id = str(uuid4())
+            data["id"] = fake_id
+            if not hasattr(self, '_local_projects'):
+                self._local_projects = {}
+            self._local_projects[fake_id] = data
+            print(f"[DB] Project '{name}' created locally (ID: {fake_id[:8]}...)")
+            return data
+
+        try:
+            response = self.client.table("projects").insert(data).execute()
+            if response.data:
+                print(f"[DB] Project '{name}' created (ID: {response.data[0]['id'][:8]}...)")
+                return response.data[0]
+        except Exception as e:
+            print(f"[DB] Error creating project: {e}")
+        return None
+
+    def get_project(self, project_id: str) -> Optional[Dict]:
+        """Fetches a project by ID, including its context_snapshot."""
+        if not self.client:
+            return getattr(self, '_local_projects', {}).get(project_id)
+
+        try:
+            response = self.client.table("projects")\
+                .select("*")\
+                .eq("id", project_id)\
+                .single()\
+                .execute()
+            return response.data
+        except Exception as e:
+            print(f"[DB] Error fetching project: {e}")
+            return None
+
+    def list_projects(self, user_id: str = None, status: str = "active") -> List[Dict]:
+        """Lists projects, optionally filtered by user and status."""
+        if not self.client:
+            projects = list(getattr(self, '_local_projects', {}).values())
+            if status:
+                projects = [p for p in projects if p.get("status") == status]
+            return projects
+
+        try:
+            query = self.client.table("projects").select("id, name, status, context_snapshot, created_at, updated_at")
+            if user_id:
+                query = query.eq("user_id", user_id)
+            if status:
+                query = query.eq("status", status)
+            response = query.order("updated_at", desc=True).execute()
+            return response.data or []
+        except Exception as e:
+            print(f"[DB] Error listing projects: {e}")
+            return []
+
+    def update_context(self, project_id: str, patch: Dict) -> Optional[Dict]:
+        """
+        Applies a deep_merge patch to a project's context_snapshot.
+        Only updates keys present in the patch; preserves everything else.
+        """
+        project = self.get_project(project_id)
+        if not project:
+            print(f"[DB] Project {project_id} not found.")
+            return None
+
+        current = project.get("context_snapshot", {})
+        merged = _deep_merge(current, patch)
+
+        if not self.client:
+            self._local_projects[project_id]["context_snapshot"] = merged
+            return merged
+
+        try:
+            response = self.client.table("projects")\
+                .update({"context_snapshot": merged})\
+                .eq("id", project_id)\
+                .execute()
+            if response.data:
+                return response.data[0].get("context_snapshot", merged)
+        except Exception as e:
+            print(f"[DB] Error updating context: {e}")
+        return merged
+
+    def save_lesson(self, content: str, lesson_type: str = "fact",
+                    project_id: str = None, source: str = "system", tags: List[str] = None) -> bool:
+        """
+        Saves a lesson to episodic_memory.
+        Types: preference | fact | feedback | mistake | success
+        """
+        data = {
+            "content": content,
+            "type": lesson_type,
+            "source": source,
+            "tags": tags or [],
+        }
+        if project_id:
+            data["project_id"] = project_id
+
+        if not self.client:
+            if not hasattr(self, '_local_memories'):
+                self._local_memories = []
+            data["id"] = str(uuid4())
+            self._local_memories.append(data)
+            print(f"[DB] Lesson saved locally: '{content[:40]}...'")
+            return True
+
+        try:
+            self.client.table("episodic_memory").insert(data).execute()
+            print(f"[DB] Lesson saved: '{content[:40]}...'")
+            return True
+        except Exception as e:
+            print(f"[DB] Error saving lesson: {e}")
+            return False
+
+    def recall_lessons(self, query: str, project_id: str = None,
+                       lesson_type: str = None, limit: int = 5) -> List[Dict]:
+        """
+        Recalls lessons from episodic_memory by keyword search.
+        Phase 3 will upgrade this to vector similarity search.
+        """
+        if not self.client:
+            # Local keyword search
+            memories = getattr(self, '_local_memories', [])
+            query_lower = query.lower()
+            results = []
+            for mem in memories:
+                if project_id and mem.get("project_id") != project_id:
+                    continue
+                if lesson_type and mem.get("type") != lesson_type:
+                    continue
+                words = query_lower.split()
+                hits = sum(1 for w in words if w in mem.get("content", "").lower())
+                if hits > 0:
+                    results.append((hits, mem))
+            results.sort(key=lambda x: x[0], reverse=True)
+            return [m for _, m in results[:limit]]
+
+        try:
+            query_builder = self.client.table("episodic_memory")\
+                .select("id, content, type, source, tags, created_at")\
+                .ilike("content", f"%{query}%")
+            if project_id:
+                query_builder = query_builder.eq("project_id", project_id)
+            if lesson_type:
+                query_builder = query_builder.eq("type", lesson_type)
+            response = query_builder\
+                .order("created_at", desc=True)\
+                .limit(limit)\
+                .execute()
+            return response.data or []
+        except Exception as e:
+            print(f"[DB] Error recalling lessons: {e}")
+            return []
+
+    def create_run(self, project_id: str, trigger_source: str = "cli",
+                   trigger_input: str = None, agents_used: List[str] = None) -> Optional[str]:
+        """
+        Creates an execution_run record. Returns the run ID.
+        """
+        data = {
+            "project_id": project_id,
+            "trigger_source": trigger_source,
+            "status": "processing",
+            "agents_used": agents_used or [],
+        }
+        if trigger_input:
+            data["trigger_input"] = trigger_input
+
+        if not self.client:
+            run_id = str(uuid4())
+            data["id"] = run_id
+            if not hasattr(self, '_local_runs'):
+                self._local_runs = {}
+            self._local_runs[run_id] = data
+            return run_id
+
+        try:
+            response = self.client.table("execution_runs").insert(data).execute()
+            if response.data:
+                return response.data[0]["id"]
+        except Exception as e:
+            print(f"[DB] Error creating run: {e}")
+        return None
+
+    def update_run(self, run_id: str, status: str = None, agent_outputs: list = None,
+                   final_plan: dict = None, state_patch: dict = None,
+                   user_feedback: str = None, feedback_sentiment: str = None) -> bool:
+        """Updates an execution_run with results."""
+        updates = {}
+        if status:
+            updates["status"] = status
+        if agent_outputs is not None:
+            updates["agent_outputs"] = agent_outputs
+        if final_plan is not None:
+            updates["final_plan"] = final_plan
+        if state_patch is not None:
+            updates["state_patch"] = state_patch
+        if user_feedback:
+            updates["user_feedback"] = user_feedback
+        if feedback_sentiment:
+            updates["feedback_sentiment"] = feedback_sentiment
+        if status in ("completed", "failed", "rejected"):
+            updates["completed_at"] = datetime.now().isoformat()
+
+        if not updates:
+            return True
+
+        if not self.client:
+            if hasattr(self, '_local_runs') and run_id in self._local_runs:
+                self._local_runs[run_id].update(updates)
+            return True
+
+        try:
+            self.client.table("execution_runs").update(updates).eq("id", run_id).execute()
+            return True
+        except Exception as e:
+            print(f"[DB] Error updating run: {e}")
+            return False
+
+
+def _deep_merge(base: dict, patch: dict) -> dict:
+    """
+    Recursively merges 'patch' into 'base'.
+    - Scalar values in patch overwrite base.
+    - Dicts are merged recursively.
+    - Base keys not in patch are preserved.
+    """
+    result = base.copy()
+    for key, value in patch.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
 
 # Global instance
 db = Database()

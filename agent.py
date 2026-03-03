@@ -25,7 +25,26 @@ def completion_with_retry(max_retries: int = 3, initial_delay: float = 20.0, **k
     
     for attempt in range(max_retries + 1):
         try:
-            return litellm.completion(**kwargs)
+            response = litellm.completion(**kwargs)
+            
+            # --- DEBUG: Inspect Empty Responses ---
+            if response and len(response.choices) > 0:
+                first_choice = response.choices[0]
+                if not first_choice.message.content and not first_choice.message.tool_calls:
+                     print(f"\n[DEBUG] ⚠️  EMPTY CONTENT DETECTED! (Attempt {attempt+1}/{max_retries})")
+                     print(f"[DEBUG] Finish Reason: {first_choice.finish_reason}")
+                     
+                     # FORCE RETRY: Treat empty content as a failure
+                     if attempt < max_retries:
+                         print(f"[Retry] Model returned empty content. Retrying...")
+                         time.sleep(delay)
+                         delay = min(delay * 1.5, 60)
+                         continue
+                     else:
+                         print(f"[Error] Max retries reached with empty content.")
+            # -------------------------------------
+            
+            return response
         except litellm.exceptions.RateLimitError as e:
             last_error = e
             # Log the FULL error for debugging
@@ -212,7 +231,7 @@ read_file_tool_definition = {
     "type": "function",
     "function": {
         "name": "read_file",
-        "description": "📂 Lê conteúdo de arquivos locais. Use para auditar código ou ler logs.",
+        "description": "📂 Lê conteúdo de arquivos locais. Suporta: .txt, .md, .py, .pdf (texto + OCR para escaneados), .png, .jpg (transcrição via Vision AI). Use para ler contratos, código, imagens e documentos.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1107,7 +1126,7 @@ Os fatos abaixo são o que você JÁ SABE sobre o usuário/projeto.
                         def run_single_rag(q):
                             try:
                                 kwargs = {"query": q}
-                                if self.corpus_id: kwargs["corpus_id"] = self.corpus_id
+                                if hasattr(self, 'corpus_id') and self.corpus_id: kwargs["corpus_id"] = self.corpus_id
                                 kwargs["agent_persona"] = self.system_instruction  # Enable Matrix Pivot
                                 return rag_query(**kwargs)
                             except Exception as e:
@@ -1115,6 +1134,7 @@ Os fatos abaixo são o que você JÁ SABE sobre o usuário/projeto.
                                 return None
 
                         print(f"[Pre-emptive] Running {len(expanded_queries)} queries in parallel...")
+                        from concurrent.futures import ThreadPoolExecutor, as_completed
                         with ThreadPoolExecutor(max_workers=3) as executor:
                             future_to_query = {executor.submit(run_single_rag, q): q for q in expanded_queries}
                             for future in as_completed(future_to_query):
@@ -1125,7 +1145,7 @@ Os fatos abaixo são o que você JÁ SABE sobre o usuário/projeto.
                                     elif isinstance(result, str) and len(result) > 50 and "No relevant" not in result:
                                         all_results.append(result[:500])
                         # --- PARALLEL EXECUTION END ---
-                        
+
                         if all_results:
                             # Deduplicate and Format (Fixing 'unhashable type: dict' crash)
                             unique_results = []
@@ -1164,8 +1184,8 @@ Os fatos abaixo são o que você JÁ SABE sobre o usuário/projeto.
                             print("="*50)
                             for i, r in enumerate(final_results):
                                 clean_r = r.replace('\n', ' ')
-                                if len(clean_r) > 120:
-                                    print(f"  {i+1}. {clean_r[:120]}...")
+                                if len(clean_r) > 500:
+                                    print(f"  {i+1}. {clean_r[:500]}...")
                                 else:
                                     print(f"  {i+1}. {clean_r}")
                             print("="*50 + "\n")
@@ -1357,30 +1377,19 @@ Os fatos abaixo são o que você JÁ SABE sobre o usuário/projeto.
                 print(f"[LLM] Iteration {i+1} | Model={self.model_name} | Temperature={self.temperature}")
                 
                 # [Emergency Truncation - Smart Slicing]
-                # Goal: Preserve System Prompt + Memory Context + Recent History
+                # Goal: Preserve System Prompt (which contains ALL memory/rag context) + Recent History + Unused Tool Calls
                 messages_to_process = messages
                 if len(messages) > 30:
                      print(f"[Loop] ⚠️ Emergency Truncation: Reducing {len(messages)} messages.")
                      
-                     # 1. System Prompt (Always first)
+                     # 1. System Prompt (Always first, holds RAG + Active Scanner Memory)
                      system_msg = messages[0]
                      
-                     # 2. Memory Context (Scan for it)
-                     memory_msgs = [
-                         m for m in messages 
-                         if m.get("role") == "user" and "[SYSTEM: CONTEXT INJECTION]" in str(m.get("content", ""))
-                     ]
-                     
-                     # 3. Recent History (Last 20)
-                     # Exclude system/memory from this slice to avoid dups, but simpler to just take tail
+                     # 2. Preserve strictly the Last 20 messages to keep immediate conversational context and open Tool Calls Context
                      recent = messages[-20:]
                      
-                     # Reassemble: System + Memory + Recent
-                     # Filter duplicates if recent overlaps with memory
-                     messages_to_process = [system_msg] + memory_msgs + [
-                         m for m in recent 
-                         if m not in memory_msgs and m != system_msg
-                     ]
+                     # Reassemble
+                     messages_to_process = [system_msg] + recent
                      print(f"[Loop] Smart Slice Result: {len(messages_to_process)} messages.")
 
                 # [Sanitizer] THEN we clean up any broken chains caused by truncation
@@ -1537,9 +1546,28 @@ Os fatos abaixo são o que você JÁ SABE sobre o usuário/projeto.
                 # Process Tool Calls
                 if response_message.tool_calls:
                     print("[Agent] Calling tools...")
+                    # [Anti-Loop] Track executed tools to prevent infinite re-query loops
+                    if not hasattr(self, '_seen_tool_signatures') or i == 0:
+                         self._seen_tool_signatures = set()
+                    
                     for tool_call in response_message.tool_calls:
                         function_name = tool_call.function.name
                         function_args = json.loads(tool_call.function.arguments)
+                        
+                        # Anti-Loop Check (Ignore duplicate tool calls with same args in the same turn)
+                        tool_signature = f"{function_name}_{json.dumps(function_args, sort_keys=True)}"
+                        if tool_signature in self._seen_tool_signatures:
+                             print(f"[Loop] ⚠️ Caught Infinite Tool Loop attempt for '{function_name}'. Forcing stop.")
+                             messages.append({
+                                 "tool_call_id": tool_call.id,
+                                 "role": "tool",
+                                 "name": function_name,
+                                 "content": json.dumps({"error": "Anti-Loop Triggered: You have already executed this exact tool search/action in this turn. Rely on the context you have and provide your final textual answer to the user now."}, ensure_ascii=False)
+                             })
+                             continue
+                        
+                        self._seen_tool_signatures.add(tool_signature)
+                        
                         function_args = self.resolve_path_aliases(function_args)
                         
                         # Writing Plan State

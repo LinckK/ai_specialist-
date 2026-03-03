@@ -68,5 +68,6 @@ debug_*.py
 service-account*.json
 *-key.json
 credentials*.json
+agenticraga-f54cae660a99.json
 # Exception: Allow agent profile JSONs
 !agent_profiles/*.json

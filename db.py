@@ -56,7 +56,7 @@ class Database:
         self.agents_memory = {}
         self.conversation_facts_memory = {}
 
-    def create_conversation(self, user_id: Optional[UUID] = None, title: str = "New Conversation") -> Conversation:
+    def create_conversation(self, user_id: Optional[UUID] = None, id_telegram: Optional[int] = None, title: str = "New Conversation") -> Conversation:
         """Creates a new conversation in the database."""
         conv_id = uuid4()
         now = datetime.now().isoformat()
@@ -64,6 +64,7 @@ class Database:
         conversation_data = {
             "id": str(conv_id),
             "user_id": str(user_id) if user_id else None,
+            "id_telegram": id_telegram,
             "title": title,
             "created_at": now,
             "updated_at": now,
@@ -128,6 +129,24 @@ class Database:
                 .select("*")\
                 .order("updated_at", desc=True)\
                 .limit(limit)\
+                .execute()
+            
+            conversations = []
+            for conv_data in response.data:
+                conversations.append(Conversation(**conv_data))
+            return conversations
+        except Exception as e:
+            print(f"[DB] Error listing conversations: {e}")
+            return []
+
+    def list_allConversationsByTelegramId(self, id_telegram: int) -> List[Conversation]:
+        if not self.client:
+            return []
+        try:
+            response = self.client.table("conversations")\
+                .select("*")\
+                .eq("id_telegram", id_telegram)\
+                .order("updated_at", desc=True)\
                 .execute()
             
             conversations = []
@@ -679,7 +698,6 @@ def _deep_merge(base: dict, patch: dict) -> dict:
         else:
             result[key] = value
     return result
-
 
 # Global instance
 db = Database()
